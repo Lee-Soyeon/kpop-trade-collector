@@ -1,0 +1,8 @@
+# K-pop 포토카드 거래 게시글 수집 스크립트 의존성
+
+requests>=2.31.0        # HTTP 요청
+pydantic>=2.5.0         # 데이터 모델
+python-dotenv>=1.0.0    # 환경변수 로드
+tenacity>=8.2.0         # 재시도 로직
+
+
