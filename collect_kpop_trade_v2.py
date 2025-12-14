@@ -184,48 +184,100 @@ class RedditAPIClient:
         return posts
 
     def get_new_posts(self, subreddit: str, limit: int = 100) -> List[TradePost]:
-        """서브레딧 최신 게시글 가져오기"""
+        """서브레딧 최신 게시글 가져오기 (단일 페이지)"""
+        posts, _ = self.get_posts_paginated(subreddit, limit=limit, max_pages=1)
+        return posts
+
+    def get_posts_paginated(
+        self,
+        subreddit: str,
+        limit: int = 500,
+        max_pages: int = 10,
+        min_date: Optional[datetime] = None,
+    ) -> tuple[List[TradePost], Optional[str]]:
+        """
+        서브레딧 게시글 페이지네이션으로 가져오기
+        
+        Args:
+            subreddit: 서브레딧 이름
+            limit: 총 가져올 게시글 수
+            max_pages: 최대 페이지 수 (각 페이지 100개)
+            min_date: 이 날짜 이후 게시글만 (None이면 제한 없음)
+        
+        Returns:
+            (게시글 리스트, 마지막 after 토큰)
+        """
         if not self.access_token:
             if not self.authenticate():
-                return []
+                return [], None
 
         headers = {
             "Authorization": f"bearer {self.access_token}",
             "User-Agent": self.user_agent,
         }
 
-        params = {"limit": min(limit, 100)}
-        url = f"https://oauth.reddit.com/r/{subreddit}/new"
+        all_posts = []
+        after = None
+        page = 0
 
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-        except Exception as e:
-            print(f"    ⚠️ 최신 게시글 가져오기 실패: {e}")
-            return []
+        while len(all_posts) < limit and page < max_pages:
+            params = {"limit": 100}
+            if after:
+                params["after"] = after
 
-        posts = []
-        for post in data.get("data", {}).get("children", []):
-            post_data = post.get("data", {})
-            created_at = datetime.fromtimestamp(post_data.get("created_utc", 0))
+            url = f"https://oauth.reddit.com/r/{subreddit}/new"
 
-            trade_post = TradePost(
-                url=f"https://reddit.com{post_data.get('permalink', '')}",
-                title=post_data.get("title", ""),
-                content=post_data.get("selftext", "")[:500],
-                snippet=post_data.get("selftext", "")[:200],
-                author=post_data.get("author"),
-                subreddit=subreddit,
-                source="reddit_api",
-                lang="en",
-                created_at=created_at,
-                score=post_data.get("score", 0),
-                num_comments=post_data.get("num_comments", 0),
-            )
-            posts.append(trade_post)
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                print(f"      ⚠️ 페이지 {page + 1} 실패: {e}")
+                break
 
-        return posts
+            children = data.get("data", {}).get("children", [])
+            if not children:
+                break
+
+            stop_pagination = False
+            for post in children:
+                post_data = post.get("data", {})
+                created_at = datetime.fromtimestamp(post_data.get("created_utc", 0))
+
+                # 날짜 필터 확인
+                if min_date and created_at < min_date:
+                    stop_pagination = True
+                    break
+
+                trade_post = TradePost(
+                    url=f"https://reddit.com{post_data.get('permalink', '')}",
+                    title=post_data.get("title", ""),
+                    content=post_data.get("selftext", "")[:500],
+                    snippet=post_data.get("selftext", "")[:200],
+                    author=post_data.get("author"),
+                    subreddit=subreddit,
+                    source="reddit_api",
+                    lang="en",
+                    created_at=created_at,
+                    score=post_data.get("score", 0),
+                    num_comments=post_data.get("num_comments", 0),
+                )
+                all_posts.append(trade_post)
+
+                if len(all_posts) >= limit:
+                    break
+
+            if stop_pagination:
+                break
+
+            after = data.get("data", {}).get("after")
+            if not after:
+                break
+
+            page += 1
+            time.sleep(1)  # Rate limit
+
+        return all_posts, after
 
 
 # ============================================================
@@ -377,8 +429,22 @@ class KpopTradeCollector:
         combined = (post.title + " " + post.snippet + " " + post.content).lower()
         return any(variant in combined for variant in artist_variants)
 
-    def collect_from_reddit_api(self, artist: str, limit: int = 200) -> List[TradePost]:
-        """Reddit API로 수집"""
+    def collect_from_reddit_api(
+        self,
+        artist: Optional[str] = None,
+        limit: int = 200,
+        max_pages: int = 5,
+        months: int = 12,
+    ) -> List[TradePost]:
+        """
+        Reddit API로 수집
+        
+        Args:
+            artist: 아티스트 이름 (None이면 모든 거래글)
+            limit: 서브레딧당 수집할 게시글 수
+            max_pages: 서브레딧당 최대 페이지 수
+            months: 몇 개월 전까지 수집할지
+        """
         if not self.reddit.is_available():
             print("  ⚠️ Reddit API 키가 설정되지 않았습니다.")
             return []
@@ -387,28 +453,40 @@ class KpopTradeCollector:
             return []
 
         print("  ✅ Reddit API 인증 성공")
+        
+        min_date = datetime.now() - timedelta(days=months * 30)
+        print(f"  📅 수집 범위: {min_date.strftime('%Y-%m-%d')} ~ 현재 ({months}개월)")
 
-        queries = self.get_search_queries(artist)["reddit_api"]
         all_posts = []
 
-        # 각 서브레딧에서 검색
+        # 각 서브레딧에서 페이지네이션으로 수집
         for subreddit in self.SUBREDDITS:
-            print(f"\n  📍 r/{subreddit}")
+            print(f"\n  📍 r/{subreddit} (최대 {max_pages}페이지)")
 
-            # 최신 게시글 가져오기
-            print(f"    [new] 최신 게시글...")
-            new_posts = self.reddit.get_new_posts(subreddit, limit=50)
-            all_posts.extend(new_posts)
-            print(f"    ✅ {len(new_posts)} posts")
+            posts, last_after = self.reddit.get_posts_paginated(
+                subreddit,
+                limit=limit,
+                max_pages=max_pages,
+                min_date=min_date,
+            )
+            all_posts.extend(posts)
+            
+            oldest = min([p.created_at for p in posts], default=None) if posts else None
+            oldest_str = oldest.strftime('%Y-%m-%d') if oldest else "N/A"
+            print(f"    ✅ {len(posts)} posts (oldest: {oldest_str})")
+            
             time.sleep(1)  # Rate limit
 
-            # 키워드 검색
-            for query in queries[:3]:  # 상위 3개 쿼리만
-                print(f"    [search] '{query}'...")
-                search_posts = self.reddit.search_subreddit(subreddit, query, limit=25)
-                all_posts.extend(search_posts)
-                print(f"    ✅ {len(search_posts)} posts")
-                time.sleep(1)  # Rate limit
+        # 추가로 키워드 검색 (artist가 지정된 경우)
+        if artist:
+            queries = self.get_search_queries(artist)["reddit_api"]
+            for subreddit in self.SUBREDDITS[:2]:  # 주요 2개만
+                for query in queries[:2]:
+                    print(f"    [search] '{query}'...")
+                    search_posts = self.reddit.search_subreddit(subreddit, query, limit=50)
+                    all_posts.extend(search_posts)
+                    print(f"    ✅ {len(search_posts)} posts")
+                    time.sleep(1)
 
         return all_posts
 
@@ -433,16 +511,32 @@ class KpopTradeCollector:
 
     def collect(
         self,
-        artist: str = "Seventeen",
-        limit: int = 200,
+        artist: Optional[str] = None,
+        limit: int = 500,
         source: str = "both",
+        max_pages: int = 10,
+        months: int = 12,
     ) -> List[TradePost]:
-        """통합 수집 실행"""
+        """
+        통합 수집 실행
+        
+        Args:
+            artist: 아티스트 이름 (None이면 모든 거래글)
+            limit: 최대 수집 개수
+            source: 데이터 소스 (both, reddit, serpapi)
+            max_pages: 서브레딧당 최대 페이지 수
+            months: 몇 개월 전까지 수집
+        """
         print("=" * 60)
-        print(f"🎵 {artist} 포토카드 거래 게시글 통합 수집 v2")
+        if artist:
+            print(f"🎵 {artist} 포토카드 거래 게시글 통합 수집 v2")
+        else:
+            print("🎵 K-pop 전체 포토카드 거래 게시글 수집 v2")
         print("=" * 60)
         print(f"🎯 Target: WTS/WTB/WTT 거래 게시글")
         print(f"📊 Limit: ~{limit} posts")
+        print(f"📅 Range: 최근 {months}개월")
+        print(f"📄 Pages: 서브레딧당 최대 {max_pages}페이지")
         print(f"🔧 Source: {source}")
         print()
 
@@ -451,22 +545,28 @@ class KpopTradeCollector:
         # Reddit API 수집
         if source in ["both", "reddit"]:
             print("📡 [1/2] Reddit API 수집 중...")
-            reddit_posts = self.collect_from_reddit_api(artist, limit)
+            reddit_posts = self.collect_from_reddit_api(
+                artist=artist,
+                limit=limit,
+                max_pages=max_pages,
+                months=months,
+            )
             all_posts.extend(reddit_posts)
             print(f"\n  📊 Reddit API 결과: {len(reddit_posts)}개")
 
-        # SerpAPI 수집
-        if source in ["both", "serpapi"]:
+        # SerpAPI 수집 (artist가 지정된 경우만)
+        if source in ["both", "serpapi"] and artist:
             print("\n🔍 [2/2] SerpAPI 수집 중...")
             serp_posts = self.collect_from_serpapi(artist, limit)
             all_posts.extend(serp_posts)
             print(f"\n  📊 SerpAPI 결과: {len(serp_posts)}개")
+        elif source in ["both", "serpapi"] and not artist:
+            print("\n🔍 [2/2] SerpAPI 건너뜀 (아티스트 미지정 시 비효율적)")
 
         # 중복 제거
         seen_urls = set()
         unique_posts = []
         for post in all_posts:
-            # URL 정규화 (trailing slash 제거)
             normalized_url = post.url.rstrip("/")
             if normalized_url not in seen_urls:
                 unique_posts.append(post)
@@ -474,13 +574,20 @@ class KpopTradeCollector:
 
         print(f"\n📊 중복 제거 후: {len(unique_posts)}개")
 
-        # 아티스트 필터링
-        artist_posts = [p for p in unique_posts if self.contains_artist(p, artist)]
-        print(f"🎤 아티스트 '{artist}' 필터 후: {len(artist_posts)}개")
+        # 아티스트 필터링 (지정된 경우만)
+        if artist:
+            artist_posts = [p for p in unique_posts if self.contains_artist(p, artist)]
+            print(f"🎤 아티스트 '{artist}' 필터 후: {len(artist_posts)}개")
+        else:
+            artist_posts = unique_posts
+            print("🎤 아티스트 필터: 없음 (전체 수집)")
 
         # 거래 키워드 필터링
         trade_posts = [p for p in artist_posts if self.is_trade_post(p)]
         print(f"🔍 거래 키워드 필터 후: {len(trade_posts)}개")
+
+        # 날짜순 정렬 (최신순)
+        trade_posts.sort(key=lambda p: p.created_at or datetime.min, reverse=True)
 
         # 제한 적용
         if len(trade_posts) > limit:
@@ -488,11 +595,14 @@ class KpopTradeCollector:
 
         return trade_posts
 
-    def save_to_jsonl(self, posts: List[TradePost], artist: str) -> Path:
+    def save_to_jsonl(self, posts: List[TradePost], artist: Optional[str] = None) -> Path:
         """JSONL 파일로 저장"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        artist_safe = artist.lower().replace(" ", "_")
-        filename = Path("data") / f"{artist_safe}_trade_v2_{timestamp}.jsonl"
+        if artist:
+            artist_safe = artist.lower().replace(" ", "_")
+            filename = Path("data") / f"{artist_safe}_trade_v2_{timestamp}.jsonl"
+        else:
+            filename = Path("data") / f"kpop_all_trade_{timestamp}.jsonl"
         Path("data").mkdir(exist_ok=True)
 
         with open(filename, "w", encoding="utf-8") as f:
@@ -526,41 +636,79 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
-  python collect_kpop_trade_v2.py                       # 세븐틴 수집
-  python collect_kpop_trade_v2.py --artist "BTS"        # BTS 수집
-  python collect_kpop_trade_v2.py --artist "TWICE"      # 트와이스 수집
-  python collect_kpop_trade_v2.py --limit 300           # 300개까지 수집
-  python collect_kpop_trade_v2.py --source reddit       # Reddit API만 사용
-  python collect_kpop_trade_v2.py --source serpapi      # SerpAPI만 사용
-  python collect_kpop_trade_v2.py --source both         # 둘 다 사용 (기본값)
+  # 전체 K-pop 거래 게시글 수집 (아티스트 필터 없음)
+  python collect_kpop_trade_v2.py --all
+  
+  # 전체 수집 + 더 많은 데이터 (10페이지, 12개월)
+  python collect_kpop_trade_v2.py --all --pages 10 --months 12
+  
+  # 특정 아티스트만 수집
+  python collect_kpop_trade_v2.py --artist "Seventeen"
+  python collect_kpop_trade_v2.py --artist "BTS"
+  
+  # 대량 수집 (1000개, 20페이지, 24개월)
+  python collect_kpop_trade_v2.py --all --limit 1000 --pages 20 --months 24
         """
     )
 
     parser.add_argument(
         "--artist",
         type=str,
-        default="Seventeen",
-        help="아티스트 이름 (기본: Seventeen)",
+        default=None,
+        help="아티스트 이름 (미지정 시 --all 필요)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="모든 K-pop 거래 게시글 수집 (아티스트 필터 없음)",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        default=200,
-        help="최대 수집 개수 (기본: 200)",
+        default=500,
+        help="최대 수집 개수 (기본: 500)",
+    )
+    parser.add_argument(
+        "--pages",
+        type=int,
+        default=5,
+        help="서브레딧당 최대 페이지 수 (기본: 5, 페이지당 100개)",
+    )
+    parser.add_argument(
+        "--months",
+        type=int,
+        default=6,
+        help="몇 개월 전까지 수집 (기본: 6)",
     )
     parser.add_argument(
         "--source",
         type=str,
         choices=["both", "reddit", "serpapi"],
-        default="both",
-        help="데이터 소스 (기본: both)",
+        default="reddit",
+        help="데이터 소스 (기본: reddit)",
     )
 
     args = parser.parse_args()
 
+    # --all 또는 --artist 중 하나는 필수
+    if not args.all and not args.artist:
+        print("❌ --all 또는 --artist 중 하나를 지정해주세요.")
+        print("예시:")
+        print("  python collect_kpop_trade_v2.py --all")
+        print("  python collect_kpop_trade_v2.py --artist 'Seventeen'")
+        return
+
+    artist = None if args.all else args.artist
+
     # 수집 실행
     collector = KpopTradeCollector()
-    posts = collector.collect(args.artist, args.limit, args.source)
+    posts = collector.collect(
+        artist=artist,
+        limit=args.limit,
+        source=args.source,
+        max_pages=args.pages,
+        months=args.months,
+    )
 
     if not posts:
         print("\n❌ 수집된 게시글이 없습니다.")
@@ -570,7 +718,7 @@ def main():
         return
 
     # 저장
-    filename = collector.save_to_jsonl(posts, args.artist)
+    filename = collector.save_to_jsonl(posts, artist)
 
     print(f"\n{'=' * 60}")
     print(f"✅ 수집 완료: {len(posts)}개 거래 게시글")
@@ -599,3 +747,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
