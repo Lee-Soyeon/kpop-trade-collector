@@ -44,23 +44,85 @@ class SearchSource(str, Enum):
 
 class TradePost(BaseModel):
     """거래 게시글 모델"""
-    url: str = Field(..., description="게시글 URL")
+    # 기본 정보
     title: str = Field(..., description="제목")
-    content: str = Field(default="", description="본문 내용")
-    snippet: str = Field(default="", description="내용 미리보기")
     author: Optional[str] = Field(default=None, description="작성자")
-    subreddit: Optional[str] = Field(default=None, description="서브레딧")
-    source: str = Field(..., description="수집 소스")
-    lang: str = Field(default="en", description="언어 코드")
-    created_at: Optional[datetime] = Field(default=None, description="작성 시간")
+    author_flair: Optional[str] = Field(default=None, description="작성자 플레어")
+    
+    # 거래 정보 (제목에서 파싱)
+    transaction_type: Optional[str] = Field(default=None, description="거래 유형 (WTS/WTB/WTT)")
+    country: Optional[str] = Field(default=None, description="국가/지역 코드")
+    
+    # 게시글 정보
+    flair: Optional[str] = Field(default=None, description="게시글 플레어")
     score: int = Field(default=0, description="업보트 수")
-    num_comments: int = Field(default=0, description="댓글 수")
-    queried_at: datetime = Field(default_factory=datetime.now, description="수집 시간")
+    comment_count: int = Field(default=0, description="댓글 수")
+    selftext: str = Field(default="", description="본문 내용")
+    
+    # 시간 정보
+    created_timestamp: Optional[datetime] = Field(default=None, description="작성 시간")
+    scraped_at: datetime = Field(default_factory=datetime.now, description="수집 시간")
+    
+    # URL 및 미디어
+    permalink: str = Field(..., description="게시글 URL")
+    first_image_url: Optional[str] = Field(default=None, description="첫 번째 이미지 URL")
+    is_gallery: bool = Field(default=False, description="갤러리 여부")
+    
+    # 메타 정보
+    subreddit: Optional[str] = Field(default=None, description="서브레딧")
+    source: str = Field(default="reddit_api", description="수집 소스")
 
 
 # ============================================================
 # Reddit API 클래스
 # ============================================================
+
+def parse_title_tags(title: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    제목에서 거래 유형과 국가 코드 파싱
+    예: "[WTS][USA] Seventeen photocard" -> ("WTS", "USA")
+    """
+    import re
+    
+    # 거래 유형 패턴
+    transaction_types = ["WTS", "WTB", "WTT", "WTT/WTS", "WTS/WTT", "ISO"]
+    transaction_type = None
+    for tt in transaction_types:
+        if tt.lower() in title.lower():
+            transaction_type = tt.upper()
+            break
+    
+    # 국가 코드 및 국가명 매핑
+    country_mapping = {
+        # 코드
+        "USA": "USA", "US": "USA", "UK": "UK", "EU": "EU", "WW": "WW",
+        "CAN": "CAN", "CA": "CAN", "AUS": "AUS", "AU": "AUS",
+        "KR": "KR", "JP": "JP", "SG": "SG", "PH": "PH", "MY": "MY",
+        "TH": "TH", "ID": "ID", "VN": "VN", "TW": "TW", "HK": "HK",
+        "NZ": "NZ", "DE": "DE", "FR": "FR", "NL": "NL", "IT": "IT",
+        "ES": "ES", "BR": "BR", "MX": "MX", "IN": "IN",
+        # 전체 국가명
+        "CANADA": "CAN", "AUSTRALIA": "AUS", "KOREA": "KR", "JAPAN": "JP",
+        "SINGAPORE": "SG", "PHILIPPINES": "PH", "MALAYSIA": "MY",
+        "THAILAND": "TH", "INDONESIA": "ID", "VIETNAM": "VN",
+        "TAIWAN": "TW", "GERMANY": "DE", "FRANCE": "FR",
+        "NETHERLANDS": "NL", "ITALY": "IT", "SPAIN": "ES",
+        "BRAZIL": "BR", "MEXICO": "MX", "INDIA": "IN",
+    }
+    
+    # 대괄호 안의 텍스트 추출
+    bracket_pattern = r'\[([^\]]+)\]'
+    bracket_matches = re.findall(bracket_pattern, title.upper())
+    
+    country = None
+    for match in bracket_matches:
+        match_clean = match.strip()
+        if match_clean in country_mapping:
+            country = country_mapping[match_clean]
+            break
+    
+    return transaction_type, country
+
 
 class RedditAPIClient:
     """Reddit OAuth API 클라이언트"""
@@ -166,18 +228,42 @@ class RedditAPIClient:
             if created_at < six_months_ago:
                 continue
 
+            title = post_data.get("title", "")
+            transaction_type, country = parse_title_tags(title)
+            
+            # 이미지 URL 추출
+            first_image_url = None
+            is_gallery = post_data.get("is_gallery", False)
+            
+            if is_gallery and "gallery_data" in post_data:
+                # 갤러리인 경우
+                media_metadata = post_data.get("media_metadata", {})
+                if media_metadata:
+                    first_key = list(media_metadata.keys())[0]
+                    first_image_url = media_metadata[first_key].get("s", {}).get("u", "")
+            elif post_data.get("url", "").endswith((".jpg", ".png", ".gif", ".jpeg", ".webp")):
+                first_image_url = post_data.get("url")
+            elif "preview" in post_data:
+                images = post_data.get("preview", {}).get("images", [])
+                if images:
+                    first_image_url = images[0].get("source", {}).get("url", "")
+            
             trade_post = TradePost(
-                url=f"https://reddit.com{post_data.get('permalink', '')}",
-                title=post_data.get("title", ""),
-                content=post_data.get("selftext", "")[:500],  # 본문 500자 제한
-                snippet=post_data.get("selftext", "")[:200],
+                title=title,
                 author=post_data.get("author"),
+                author_flair=post_data.get("author_flair_text"),
+                transaction_type=transaction_type,
+                country=country,
+                flair=post_data.get("link_flair_text"),
+                score=post_data.get("score", 0),
+                comment_count=post_data.get("num_comments", 0),
+                selftext=post_data.get("selftext", ""),
+                created_timestamp=created_at,
+                permalink=f"https://reddit.com{post_data.get('permalink', '')}",
+                first_image_url=first_image_url,
+                is_gallery=is_gallery,
                 subreddit=subreddit,
                 source="reddit_api",
-                lang="en",
-                created_at=created_at,
-                score=post_data.get("score", 0),
-                num_comments=post_data.get("num_comments", 0),
             )
             posts.append(trade_post)
 
@@ -249,18 +335,41 @@ class RedditAPIClient:
                     stop_pagination = True
                     break
 
+                title = post_data.get("title", "")
+                transaction_type, country = parse_title_tags(title)
+                
+                # 이미지 URL 추출
+                first_image_url = None
+                is_gallery = post_data.get("is_gallery", False)
+                
+                if is_gallery and "gallery_data" in post_data:
+                    media_metadata = post_data.get("media_metadata", {})
+                    if media_metadata:
+                        first_key = list(media_metadata.keys())[0]
+                        first_image_url = media_metadata[first_key].get("s", {}).get("u", "")
+                elif post_data.get("url", "").endswith((".jpg", ".png", ".gif", ".jpeg", ".webp")):
+                    first_image_url = post_data.get("url")
+                elif "preview" in post_data:
+                    images = post_data.get("preview", {}).get("images", [])
+                    if images:
+                        first_image_url = images[0].get("source", {}).get("url", "")
+                
                 trade_post = TradePost(
-                    url=f"https://reddit.com{post_data.get('permalink', '')}",
-                    title=post_data.get("title", ""),
-                    content=post_data.get("selftext", "")[:500],
-                    snippet=post_data.get("selftext", "")[:200],
+                    title=title,
                     author=post_data.get("author"),
+                    author_flair=post_data.get("author_flair_text"),
+                    transaction_type=transaction_type,
+                    country=country,
+                    flair=post_data.get("link_flair_text"),
+                    score=post_data.get("score", 0),
+                    comment_count=post_data.get("num_comments", 0),
+                    selftext=post_data.get("selftext", ""),
+                    created_timestamp=created_at,
+                    permalink=f"https://reddit.com{post_data.get('permalink', '')}",
+                    first_image_url=first_image_url,
+                    is_gallery=is_gallery,
                     subreddit=subreddit,
                     source="reddit_api",
-                    lang="en",
-                    created_at=created_at,
-                    score=post_data.get("score", 0),
-                    num_comments=post_data.get("num_comments", 0),
                 )
                 all_posts.append(trade_post)
 
@@ -334,12 +443,25 @@ class SerpAPIClient:
 
         posts = []
         for item in data.get("organic_results", []):
+            title = item.get("title", "")
+            transaction_type, country = parse_title_tags(title)
+            
             post = TradePost(
-                url=item.get("link", ""),
-                title=item.get("title", ""),
-                snippet=item.get("snippet", ""),
+                title=title,
+                author=None,
+                author_flair=None,
+                transaction_type=transaction_type,
+                country=country,
+                flair=None,
+                score=0,
+                comment_count=0,
+                selftext=item.get("snippet", ""),
+                created_timestamp=None,
+                permalink=item.get("link", ""),
+                first_image_url=None,
+                is_gallery=False,
+                subreddit=None,
                 source="serpapi",
-                lang=language,
             )
             posts.append(post)
 
@@ -394,7 +516,10 @@ class KpopTradeCollector:
 
     def is_trade_post(self, post: TradePost) -> bool:
         """거래 관련 게시글인지 확인"""
-        combined = (post.title + " " + post.snippet + " " + post.content).lower()
+        # transaction_type이 이미 파싱되어 있으면 거래글
+        if post.transaction_type:
+            return True
+        combined = (post.title + " " + post.selftext).lower()
         return any(kw in combined for kw in self.TRADE_KEYWORDS)
 
     def contains_artist(self, post: TradePost, artist: str) -> bool:
@@ -426,7 +551,7 @@ class KpopTradeCollector:
         if artist_lower in artist_aliases:
             artist_variants.extend(artist_aliases[artist_lower])
         
-        combined = (post.title + " " + post.snippet + " " + post.content).lower()
+        combined = (post.title + " " + post.selftext).lower()
         return any(variant in combined for variant in artist_variants)
 
     def collect_from_reddit_api(
@@ -471,7 +596,7 @@ class KpopTradeCollector:
             )
             all_posts.extend(posts)
             
-            oldest = min([p.created_at for p in posts], default=None) if posts else None
+            oldest = min([p.created_timestamp for p in posts if p.created_timestamp], default=None) if posts else None
             oldest_str = oldest.strftime('%Y-%m-%d') if oldest else "N/A"
             print(f"    ✅ {len(posts)} posts (oldest: {oldest_str})")
             
@@ -567,7 +692,7 @@ class KpopTradeCollector:
         seen_urls = set()
         unique_posts = []
         for post in all_posts:
-            normalized_url = post.url.rstrip("/")
+            normalized_url = post.permalink.rstrip("/")
             if normalized_url not in seen_urls:
                 unique_posts.append(post)
                 seen_urls.add(normalized_url)
@@ -587,7 +712,7 @@ class KpopTradeCollector:
         print(f"🔍 거래 키워드 필터 후: {len(trade_posts)}개")
 
         # 날짜순 정렬 (최신순)
-        trade_posts.sort(key=lambda p: p.created_at or datetime.min, reverse=True)
+        trade_posts.sort(key=lambda p: p.created_timestamp or datetime.min, reverse=True)
 
         # 제한 적용
         if len(trade_posts) > limit:
@@ -608,18 +733,20 @@ class KpopTradeCollector:
         with open(filename, "w", encoding="utf-8") as f:
             for post in posts:
                 data = {
-                    "url": post.url,
                     "title": post.title,
-                    "content": post.content,
-                    "snippet": post.snippet,
                     "author": post.author,
-                    "subreddit": post.subreddit,
-                    "source": post.source,
-                    "lang": post.lang,
-                    "created_at": post.created_at.isoformat() if post.created_at else None,
+                    "author_flair": post.author_flair,
+                    "transaction_type": post.transaction_type,
+                    "country": post.country,
+                    "flair": post.flair,
                     "score": post.score,
-                    "num_comments": post.num_comments,
-                    "queried_at": post.queried_at.isoformat(),
+                    "comment_count": post.comment_count,
+                    "selftext": post.selftext,
+                    "created_timestamp": post.created_timestamp.isoformat() if post.created_timestamp else None,
+                    "permalink": post.permalink,
+                    "first_image_url": post.first_image_url,
+                    "is_gallery": post.is_gallery,
+                    "scraped_at": post.scraped_at.isoformat(),
                 }
                 f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
